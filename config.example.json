@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "queue": {
+    "ipv4": true,
+    "ipv6": true
+  },
+  "system": {
+    "mtproto": {
+      "enabled": true,
+      "port": 3128,
+      "bind_address": "0.0.0.0",
+      "max_connections": 2048,
+      "tcp_user_timeout_sec": 0,
+      "idle_timeout_sec": 0,
+      "bridge_wait_sec": 0,
+      "secrets": [
+        {"id": "phone",  "name": "phone",  "secret": "ee0102030405060708090a0b0c0d0e0f10777777772e676f6f676c652e636f6d", "enabled": true},
+        {"id": "laptop", "name": "laptop", "secret": "ee1112131415161718191a1b1c1d1e1f20777777772e636c6f7564666c6172652e636f6d", "enabled": true},
+        {"id": "old",    "name": "old",    "secret": "ee2122232425262728292a2b2c2d2e2f30777777772e6d6963726f736f66742e636f6d", "enabled": false}
+      ],
+      "fake_sni": "storage.googleapis.com",
+      "dc_relay": "",
+      "upstream_mode": "auto",
+      "ws_custom_domain": "",
+      "ws_endpoint_host": "149.154.167.220",
+      "cfproxy_enabled": true,
+      "cfproxy_url": "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
+      "cfworker_domain": "",
+      "dc_fallback_enabled": true,
+      "dc_fallback_url": "https://proxy.lavrush.in/telegram/getProxyConfig",
+      "web_proxy": {
+        "enabled": false,
+        "hostname": ""
+      }
+    }
+  }
+}
