@@ -42,7 +42,7 @@ func TestRelayConns_ReportsMuteUpstream(t *testing.T) {
 		}
 	}()
 
-	relayConns(clientB, dcB, nil, "test", relayPool(), 0, nil, onStall)
+	relayConns(clientB, dcB, relayOpts{label: "test", bufPool: relayPool(), onStall: onStall})
 
 	select {
 	case <-stalled:
@@ -73,7 +73,7 @@ func TestRelayConns_ReportsUpstreamThatClosesWithoutAnswering(t *testing.T) {
 		_ = dcA.Close()
 	}()
 
-	relayConns(clientB, dcB, nil, "test", relayPool(), 0, nil, onStall)
+	relayConns(clientB, dcB, relayOpts{label: "test", bufPool: relayPool(), onStall: onStall})
 
 	select {
 	case <-stalled:
@@ -114,7 +114,7 @@ func TestRelayConns_ClientClosingBeforeAnAnswerIsDueIsNotReported(t *testing.T) 
 		}
 	}()
 
-	relayConns(clientB, dcB, nil, "test", relayPool(), 0, nil, onStall)
+	relayConns(clientB, dcB, relayOpts{label: "test", bufPool: relayPool(), onStall: onStall})
 
 	select {
 	case <-stalled:
@@ -138,7 +138,7 @@ func TestRelayConns_ClientThatAskedNothingIsNotReported(t *testing.T) {
 
 	go func() { _ = clientA.Close() }()
 
-	relayConns(clientB, dcB, nil, "test", relayPool(), 0, nil, onStall)
+	relayConns(clientB, dcB, relayOpts{label: "test", bufPool: relayPool(), onStall: onStall})
 
 	select {
 	case <-stalled:
@@ -179,7 +179,7 @@ func TestRelayConns_HealthyUpstreamNotReported(t *testing.T) {
 		_ = clientA.Close()
 	}()
 
-	relayConns(clientB, dcB, nil, "test", relayPool(), 0, nil, onStall)
+	relayConns(clientB, dcB, relayOpts{label: "test", bufPool: relayPool(), onStall: onStall})
 
 	select {
 	case <-stalled:

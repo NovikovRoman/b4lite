@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,8 +66,9 @@ type Server struct {
 	statsMu sync.Mutex
 	stats   map[string]*secretStat
 
-	connsMu sync.Mutex
-	conns   map[string]*secretConnSet
+	connsMu  sync.Mutex
+	conns    map[string]*secretConnSet
+	refusals map[string]*refusalState
 
 	webTickets webTicketStore
 
@@ -84,16 +87,19 @@ type secretStat struct {
 }
 
 type SecretStat struct {
-	Name      string
-	Active    int64
-	Total     int64
-	BytesUp   int64
-	BytesDown int64
+	Name         string
+	Active       int64
+	Total        int64
+	BytesUp      int64
+	BytesDown    int64
+	Networks     int
+	NetworkAddrs []string
 }
 
 type Stats struct {
 	Enabled           bool
 	Port              int
+	Networks          int
 	ActiveConnections int64
 	TotalConnections  int64
 	BytesUp           int64
@@ -124,14 +130,52 @@ type connInfo struct {
 	secretName  string
 	clientIP    string
 	clientPort  int
+	network     string
 	connectedAt time.Time
 	dest        atomic.Pointer[string]
 	lastActive  atomic.Int64
 }
 
 type secretConnSet struct {
-	label string
-	conns map[net.Conn]*connInfo
+	label    string
+	conns    map[net.Conn]*connInfo
+	networks map[string]int
+}
+
+type refusalState struct {
+	total int64
+	last  time.Time
+}
+
+type secretPolicy struct {
+	active      bool
+	maxNetworks int
+}
+
+type denyInfo struct {
+	limit int
+	total int64
+	log   bool
+}
+
+const refusalLogInterval = 60 * time.Second
+
+func (s *Server) refuseLocked(id string, now time.Time, limit int) denyInfo {
+	if s.refusals == nil {
+		s.refusals = make(map[string]*refusalState)
+	}
+	r := s.refusals[id]
+	if r == nil {
+		r = &refusalState{}
+		s.refusals[id] = r
+	}
+	r.total++
+	d := denyInfo{limit: limit, total: r.total}
+	if now.Sub(r.last) >= refusalLogInterval {
+		r.last = now
+		d.log = true
+	}
+	return d
 }
 
 type SessionInfo struct {
@@ -152,7 +196,7 @@ func secretIdentity(sec *Secret) string {
 	return key + "|" + sec.Hex()
 }
 
-func (s *Server) trackConn(sec *Secret, c net.Conn) (*connInfo, func()) {
+func (s *Server) trackConn(sec *Secret, c net.Conn) (*connInfo, func(), denyInfo) {
 	id := secretIdentity(sec)
 	info := &connInfo{
 		secretID:    sec.ID,
@@ -165,29 +209,50 @@ func (s *Server) trackConn(sec *Secret, c net.Conn) (*connInfo, func()) {
 			info.clientPort = p
 		}
 	}
+	info.network = networkKeyOf(info.clientIP)
 	info.lastActive.Store(info.connectedAt.UnixNano())
 
 	s.connsMu.Lock()
+	limit := s.secretPolicyOf(sec).maxNetworks
 	if s.conns == nil {
 		s.conns = make(map[string]*secretConnSet)
 	}
 	set := s.conns[id]
 	if set == nil {
-		set = &secretConnSet{label: sec.Label(), conns: make(map[net.Conn]*connInfo)}
+		set = &secretConnSet{
+			label:    sec.Label(),
+			conns:    make(map[net.Conn]*connInfo),
+			networks: make(map[string]int),
+		}
 		s.conns[id] = set
+	} else if info.network != "" && limit > 0 &&
+		set.networks[info.network] == 0 && len(set.networks) >= limit {
+		d := s.refuseLocked(id, info.connectedAt, limit)
+		s.connsMu.Unlock()
+		return nil, func() {}, d
 	}
 	set.conns[c] = info
+	if info.network != "" {
+		set.networks[info.network]++
+	}
 	s.connsMu.Unlock()
 	return info, func() {
 		s.connsMu.Lock()
 		if set := s.conns[id]; set != nil {
-			delete(set.conns, c)
+			if _, tracked := set.conns[c]; tracked {
+				delete(set.conns, c)
+				if n := set.networks[info.network]; n > 1 {
+					set.networks[info.network] = n - 1
+				} else if n == 1 {
+					delete(set.networks, info.network)
+				}
+			}
 			if len(set.conns) == 0 {
 				delete(s.conns, id)
 			}
 		}
 		s.connsMu.Unlock()
-	}
+	}, denyInfo{}
 }
 
 func (s *Server) Sessions() []SessionInfo {
@@ -213,18 +278,51 @@ func (s *Server) Sessions() []SessionInfo {
 	return out
 }
 
-func (s *Server) secretActive(sec *Secret) bool {
+const maxNetworkAddrsPerSecret = 32
+
+func networkKeyOf(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	return netip.PrefixFrom(addr, 64).Masked().String()
+}
+
+func (s *Server) networkSnapshot() map[string][]string {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	out := make(map[string][]string, len(s.conns))
+	for id, set := range s.conns {
+		keys := make([]string, 0, len(set.networks))
+		for key := range set.networks {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		out[id] = keys
+	}
+	return out
+}
+
+func (s *Server) secretPolicyOf(sec *Secret) secretPolicy {
 	ptr := s.secrets.Load()
 	if ptr == nil {
-		return false
+		return secretPolicy{}
 	}
 	id := secretIdentity(sec)
 	for _, cur := range *ptr {
 		if secretIdentity(cur) == id {
-			return true
+			return secretPolicy{active: true, maxNetworks: cur.MaxNetworks}
 		}
 	}
-	return false
+	return secretPolicy{}
+}
+
+func (s *Server) secretActive(sec *Secret) bool {
+	return s.secretPolicyOf(sec).active
 }
 
 func (s *Server) closeRevokedConns(active []*Secret) {
@@ -257,6 +355,20 @@ func (s *Server) closeRevokedConns(active []*Secret) {
 		}
 		log.Infof("MTProto: closed %d active connection(s) for revoked secret %q", len(v.conns), v.label)
 	}
+}
+
+func (s *Server) pruneRefusals(active []*Secret) {
+	allowed := make(map[string]struct{}, len(active))
+	for _, sec := range active {
+		allowed[secretIdentity(sec)] = struct{}{}
+	}
+	s.connsMu.Lock()
+	for id := range s.refusals {
+		if _, ok := allowed[id]; !ok {
+			delete(s.refusals, id)
+		}
+	}
+	s.connsMu.Unlock()
 }
 
 func (s *Server) pruneStats(active []*Secret) {
@@ -308,6 +420,9 @@ func (s *Server) Stats() Stats {
 		return out
 	}
 
+	networks := s.networkSnapshot()
+	allNetworks := make(map[string]struct{})
+
 	s.statsMu.Lock()
 	defer s.statsMu.Unlock()
 	for _, sec := range *secsPtr {
@@ -316,6 +431,16 @@ func (s *Server) Stats() Stats {
 			key = sec.Label()
 		}
 		ss := SecretStat{Name: sec.Label()}
+		if keys, ok := networks[secretIdentity(sec)]; ok {
+			ss.Networks = len(keys)
+			for _, k := range keys {
+				allNetworks[k] = struct{}{}
+			}
+			if len(keys) > maxNetworkAddrsPerSecret {
+				keys = keys[:maxNetworkAddrsPerSecret]
+			}
+			ss.NetworkAddrs = keys
+		}
 		if st := s.stats[key]; st != nil {
 			ss.Active = st.active.Load()
 			ss.Total = st.total.Load()
@@ -328,6 +453,7 @@ func (s *Server) Stats() Stats {
 		out.BytesUp += ss.BytesUp
 		out.BytesDown += ss.BytesDown
 	}
+	out.Networks = len(allNetworks)
 	return out
 }
 
@@ -364,6 +490,7 @@ func buildSecrets(cfg *config.Config) ([]*Secret, error) {
 		}
 		sec.ID = entry.ID
 		sec.Name = entry.Name
+		sec.MaxNetworks = entry.MaxNetworks
 		secrets = append(secrets, sec)
 	}
 	if len(secrets) > 0 {
@@ -423,6 +550,7 @@ func (s *Server) startLocked() error {
 	s.listener = ln
 	s.secrets.Store(&secrets)
 	s.closeRevokedConns(secrets)
+	s.pruneRefusals(secrets)
 	s.pruneStats(secrets)
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
@@ -485,6 +613,7 @@ func (s *Server) reloadSecretsLocked(cfg *config.Config) {
 	}
 	s.secrets.Store(&secrets)
 	s.closeRevokedConns(secrets)
+	s.pruneRefusals(secrets)
 	s.pruneStats(secrets)
 	log.Infof("MTProto secrets reloaded live (%d active) without restart", len(secrets))
 }
@@ -649,7 +778,14 @@ func (s *Server) serveClient(raw net.Conn, plain net.Conn, secret *Secret, clien
 	cfg := s.cfg.Load()
 	user := secret.Label()
 
-	info, untrack := s.trackConn(secret, raw)
+	info, untrack, deny := s.trackConn(secret, raw)
+	if deny.limit > 0 {
+		if deny.log {
+			log.Infof("%s proxy secret %q is at its limit of %d network(s), refusing %s (%d refused so far)",
+				tag, user, deny.limit, clientAddr, deny.total)
+		}
+		return
+	}
 	defer untrack()
 	if !s.secretActive(secret) {
 		log.Infof("%s proxy secret %q revoked, dropping connection from %s", tag, user, clientAddr)
@@ -692,13 +828,70 @@ func (s *Server) serveClient(raw net.Conn, plain net.Conn, secret *Secret, clien
 	defer st.active.Add(-1)
 
 	splitter := newSplitterFor(dcConn, dial, result.ProtoTag)
-	up, down := s.relay(result.Conn, dcConn, splitter, &info.lastActive, dial, fmt.Sprintf("%s [%s] %s<->DC%d via %s", tag, user, clientAddr, result.DC, dial.transport))
+	route := dial.transport
+	if r := dial.plan.routeName(); r != "" && r != route {
+		route += " " + r
+	}
+	up, down := s.relay(result, dcConn, splitter, &info.lastActive, dial,
+		fmt.Sprintf("%s [%s] %s<->DC%d via %s", tag, user, clientAddr, result.DC, route))
 	st.up.Add(up)
 	st.down.Add(down)
 }
 
-func (s *Server) relay(client, dc io.ReadWriteCloser, splitter *msgSplitter, lastActive *atomic.Int64, dial dialInfo, label string) (up, down int64) {
-	return relayConns(client, dc, splitter, label, &s.bufPool, mtprotoIdleTimeout(s.cfg.Load()), lastActive, stallReporter(dial))
+func (s *Server) relay(result *ClientHandshakeResult, dc io.ReadWriteCloser, splitter *msgSplitter, lastActive *atomic.Int64, dial dialInfo, label string) (up, down int64) {
+	return relayConns(result.Conn, dc, relayOpts{
+		splitter:       splitter,
+		label:          label,
+		bufPool:        &s.bufPool,
+		idle:           mtprotoIdleTimeout(s.cfg.Load()),
+		lastActive:     lastActive,
+		onStall:        stallReporter(dial),
+		scan:           newDCFrameScanner(result.ProtoTag),
+		onTransportErr: transportErrHandler(dial, result.DC, label),
+	})
+}
+
+// transportErrHandler decides what to do with a transport error coming back from
+// the data center, and says so in the log either way.
+//
+// -444 means the session reached a data center that is not the one the client
+// asked for. The client repeats its DC inside the RSA-encrypted p_q_inner_data,
+// which the proxy can neither read nor correct, so the mismatch is always the
+// proxy's choice of route and never the user's configuration - and both
+// Telegram clients answer a single -444 by telling the user the proxy is
+// misconfigured and switching it off. Swallow it, rank the route down, and let
+// the client redial onto another one. Every other code is between the client
+// and Telegram, so it is passed on.
+func transportErrHandler(dial dialInfo, clientDC int, label string) func(int32) bool {
+	return func(code int32) bool {
+		if code != tgErrInvalidDC {
+			log.Warnf("%s upstream transport error %d (%s), relayed to the client", label, code, transportErrName(code))
+			return false
+		}
+		log.Warnf("%s upstream answered -444 (invalid DC) for a DC %d session: the route does not end at the data center the client asked for, cutting it and ranking the route down",
+			label, clientDC)
+		demoteRejectedRoute(dial, clientDC)
+		return true
+	}
+}
+
+// demoteRejectedRoute records that a route landed a session on the wrong data
+// center, so the next dial for that DC prefers something else. Nothing used to
+// score a route on what happened after the dial unless it was a Worker, so a
+// route that rejected every session kept its place at the front of the list.
+func demoteRejectedRoute(dial dialInfo, clientDC int) {
+	p := dial.plan
+	switch {
+	case p.isWorker && p.sni != "":
+		workerRecordStall(p.sni)
+	case p.cfBase != "":
+		cfBalancerInst.penalize(p.cfBase, cfProxyTimeoutCooldown)
+	case p.native && p.dialHost != "" && p.sni != "":
+		wsEndpointFailed(p.dialHost, p.sni)
+		wsRecordFailure(clientDC, false)
+	case p.kind == transportTCP && p.addr != "":
+		tcpRecordFailure(p.addr)
+	}
 }
 
 // A relay whose upstream has gone mute while the client is still asking is not
@@ -719,7 +912,27 @@ func (s *Server) relay(client, dc io.ReadWriteCloser, splitter *msgSplitter, las
 // 69-103 ms were each recorded as a stall and kept the Worker in cooldown.
 const relayStallClose = 8 * time.Second
 
-func relayConns(client, dc io.ReadWriteCloser, splitter *msgSplitter, label string, bufPool *sync.Pool, idle time.Duration, lastActive *atomic.Int64, onStall func()) (int64, int64) {
+// relayOpts is everything the relay needs beyond the two ends it joins.
+type relayOpts struct {
+	splitter   *msgSplitter
+	label      string
+	bufPool    *sync.Pool
+	idle       time.Duration
+	lastActive *atomic.Int64
+	onStall    func()
+	// scan reads the transport framing coming back from the data center. Without
+	// it a four-byte transport error was relayed to the client untouched, and the
+	// client answered -444 by telling the user the proxy is misconfigured and
+	// switching it off.
+	scan *dcFrameScanner
+	// onTransportErr is called with the code of every transport error seen on the
+	// way back. It returns true when the error is the proxy's own fault and must
+	// not reach the client, in which case the relay is cut instead.
+	onTransportErr func(int32) bool
+}
+
+func relayConns(client, dc io.ReadWriteCloser, o relayOpts) (int64, int64) {
+	splitter, label, bufPool, idle, lastActive, onStall := o.splitter, o.label, o.bufPool, o.idle, o.lastActive, o.onStall
 	type relayEnd struct {
 		dir string
 		err error
@@ -759,10 +972,34 @@ func relayConns(client, dc io.ReadWriteCloser, splitter *msgSplitter, label stri
 					lastDown.Store(time.Now().UnixNano())
 					upSinceDown.Store(0)
 				}
-				if _, werr := dst.Write(buf[:n]); werr != nil {
-					err = werr
-				} else {
-					total += int64(n)
+				out := buf[:n]
+				var rest []byte
+				var code int32
+				var rejected bool
+				if !up && o.scan != nil {
+					out, rest, code, rejected = o.scan.feed(out)
+				}
+				if rejected && o.onTransportErr != nil && o.onTransportErr(code) {
+					// The proxy chose the route that produced this, so the client
+					// must not see it: forward what came before and end the
+					// session there.
+					rest = nil
+				} else if rejected {
+					// Between the client and Telegram: put the frame back where it
+					// was and carry on.
+					out = append(append(append([]byte(nil), out...), transportErrFrame(o.scan.proto, code)...), rest...)
+					rest = nil
+					rejected = false
+				}
+				if len(out) > 0 {
+					if _, werr := dst.Write(out); werr != nil {
+						err = werr
+					} else {
+						total += int64(len(out))
+					}
+				}
+				if rejected && err == nil {
+					err = errUpstreamRejected
 				}
 			}
 			if err != nil {

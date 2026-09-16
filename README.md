@@ -88,7 +88,7 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
     "mtproto": {
       "port": 3128,
       "secrets": [
-        {"id": "phone",  "name": "phone",  "secret": "ee0102...", "enabled": true},
+        {"id": "phone",  "name": "phone",  "secret": "ee0102...", "enabled": true, "max_networks": 2},
         {"id": "laptop", "name": "laptop", "secret": "ee1112...", "enabled": true},
         {"id": "old",    "name": "old",    "secret": "ee2122...", "enabled": false}
       ]
@@ -99,6 +99,15 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
 
 Флаги `-secret`/`-secret-host`, если они заданы, полностью заменяют
 содержимое конфигурационного файла, а не объединяются с ним.
+
+`max_networks` ограничивает секрет сверху числом одновременно
+используемых сетей (один IPv4-адрес или один IPv6 /64 считаются одной
+сетью, так что смена адреса у одного и того же клиента не съедает
+лимит) - `0` (по умолчанию) означает "без ограничения". Подключение
+сверх лимита отклоняется, а не вытесняет уже работающих клиентов, так
+что случайно (или намеренно) переданный кому-то ещё секрет стоит
+лишнего отказа в соединении, а не обрыва чужой сессии. Текущее число
+занятых сетей на секрет видно в `Server.Stats()`.
 
 ## Пример полного config.json
 
@@ -161,6 +170,7 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
 | `system.mtproto.idle_timeout_sec`         | таймаут простаивающего соединения в секундах (`0` = не задавать)                                 |
 | `system.mtproto.bridge_wait_sec`          | сколько секунд ждать установления WebSocket/мостового соединения                                 |
 | `system.mtproto.secrets`                  | список секретов (см. раздел "Несколько секретов" выше); `enabled: false` отзывает секрет без удаления |
+| `system.mtproto.secrets[].max_networks`   | лимит одновременно используемых секретом сетей (`0` = без ограничения); подключение сверх лимита отклоняется |
 | `system.mtproto.fake_sni`                 | домен, под который маскируется fake-TLS рукопожатие                                              |
 | `system.mtproto.dc_relay`                 | адрес релея дата-центра (если требуется нестандартная маршрутизация)                              |
 | `system.mtproto.upstream_mode`            | `auto` \| `ws` \| `tcp` - способ обращения к дата-центрам Telegram                                |

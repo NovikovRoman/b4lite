@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,7 +222,8 @@ func (s *Server) serveWebCarrier(w http.ResponseWriter, r *http.Request, host st
 		webWriteSite(w, r, http.StatusNotFound)
 		return
 	}
-	if webCarriers.Load() >= webMaxCarriers {
+	if webCarriers.Add(1) > webMaxCarriers {
+		webCarriers.Add(-1)
 		webWriteSite(w, r, http.StatusNotFound)
 		return
 	}
@@ -230,9 +232,9 @@ func (s *Server) serveWebCarrier(w http.ResponseWriter, r *http.Request, host st
 		"Sec-Websocket-Protocol": []string{subproto},
 	})
 	if err != nil {
+		webCarriers.Add(-1)
 		return
 	}
-	webCarriers.Add(1)
 
 	id := nextConnID()
 	tag := tg(id)
@@ -259,13 +261,31 @@ func webRequestedSubprotocol(r *http.Request) string {
 	return ""
 }
 
+// webPeerCanSetForwardedFor reports whether the immediate TCP peer is trusted
+// to set X-Forwarded-For, i.e. it looks like a local reverse proxy rather than
+// an internet client that could use the header to spoof its logged address.
+func webPeerCanSetForwardedFor(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.WithZone("").Unmap()
+	return addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsPrivate()
+}
+
 func webClientAddr(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" && webPeerCanSetForwardedFor(r.RemoteAddr) {
 		if i := strings.IndexByte(v, ','); i >= 0 {
 			v = v[:i]
 		}
 		if v = strings.TrimSpace(v); v != "" {
-			return net.JoinHostPort(v, "0")
+			if addr, err := netip.ParseAddr(v); err == nil {
+				return net.JoinHostPort(addr.WithZone("").Unmap().String(), "0")
+			}
 		}
 	}
 	return r.RemoteAddr

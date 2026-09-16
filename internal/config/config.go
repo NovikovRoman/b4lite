@@ -24,6 +24,12 @@ type MTProtoSecret struct {
 	Name    string `json:"name"`
 	Secret  string `json:"secret"`
 	Enabled bool   `json:"enabled"`
+	// MaxNetworks caps how many distinct client networks (one IPv4 address, or
+	// one /64 for IPv6) may use this secret at once; 0 means unlimited. A
+	// connection from a network beyond the limit is refused rather than closing
+	// an existing one, so handing a secret to one more person than intended
+	// costs that person a connection rather than someone already using it.
+	MaxNetworks int `json:"max_networks,omitempty"`
 }
 
 func (m *MTProtoConfig) EffectiveSecrets() []MTProtoSecret {
