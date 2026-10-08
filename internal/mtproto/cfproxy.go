@@ -8,10 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/NovikovRoman/b4lite/internal/log"
 )
 
 const (
@@ -22,7 +19,7 @@ const (
 	cfProxyFetchMaxLen = 65536
 	// cfProxyDomainCooldown is how long a CF-proxy domain is skipped after it
 	// returns 429/503. Shared public domains get rate-limited in bursts; without
-	// this, every dial re-hammers all 11 and DC1/3/5 (which have no Telegram WS
+	// this, every dial re-hammers all of them and DC1/3/5 (which have no Telegram WS
 	// edge) stall entirely. Matches the observed recovery window in the field.
 	cfProxyDomainCooldown = 60 * time.Second
 	// cfProxyTimeoutCooldown is the same idea for a domain that answers nothing
@@ -46,6 +43,16 @@ var defaultCFProxyEncoded = []string{
 	"tjacxbqtj.com",
 	"bxaxtxmrw.com",
 	"dmohrsgmohcrwb.com",
+	"vwbmtmoi.com",
+	"khgrre.com",
+	"ulihssf.com",
+	"tmhqsdqmfpmk.com",
+	"xwuwoqbm.com",
+	"orgcnunpj.com",
+	"zhkuldz.com",
+	"zypoljnslxa.com",
+	"efabnxaowuzs.com",
+	"zaftuzsftqdq.com",
 }
 
 // decodeCFDomain reverses the Flowseal/tg-ws-proxy obfuscation.
@@ -270,7 +277,8 @@ func (b *cfBalancer) refreshFromURL(url string) error {
 		return err
 	}
 	req.Header.Set("User-Agent", "b4-mtproto")
-	cli := &http.Client{Timeout: 10 * time.Second}
+	cli := markedHTTPClient(int(selfDialMark()), 10*time.Second)
+	defer cli.CloseIdleConnections()
 	resp, err := cli.Do(req)
 	if err != nil {
 		return err
@@ -349,44 +357,4 @@ func cfproxyCacheBust() string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-var (
-	cfRefreshOnce sync.Once
-	cfRefreshURL  atomic.Pointer[string]
-)
-
-func StartCFProxyRefresh(ctx interface{ Done() <-chan struct{} }, url string) {
-	cfRefreshURL.Store(&url)
-	cfRefreshOnce.Do(func() {
-		go runCFProxyRefreshLoop(ctx)
-	})
-}
-
-func runCFProxyRefreshLoop(ctx interface{ Done() <-chan struct{} }) {
-	currentURL := func() string {
-		if p := cfRefreshURL.Load(); p != nil {
-			return *p
-		}
-		return ""
-	}
-	if err := cfBalancerInst.refreshFromURL(currentURL()); err != nil {
-		log.Warnf("CF proxy refresh failed at startup: %v", err)
-	} else {
-		log.Infof("CF proxy pool refreshed (%d domains)", cfBalancerInst.size())
-	}
-	ticker := time.NewTicker(cfProxyRefreshInt)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := cfBalancerInst.refreshFromURL(currentURL()); err != nil {
-				log.Debugf("CF proxy refresh failed: %v", err)
-			} else {
-				log.Debugf("CF proxy pool refreshed (%d domains)", cfBalancerInst.size())
-			}
-		}
-	}
 }

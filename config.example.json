@@ -23,6 +23,7 @@
       "upstream_mode": "auto",
       "ws_custom_domain": "",
       "ws_endpoint_host": "149.154.167.220",
+      "ws_front_sni": "",
       "cfproxy_enabled": true,
       "cfproxy_url": "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
       "cfworker_domain": "",
@@ -30,7 +31,10 @@
       "dc_fallback_url": "https://proxy.lavrush.in/telegram/getProxyConfig",
       "web_proxy": {
         "enabled": false,
-        "hostname": ""
+        "hostname": "",
+        "port": 0,
+        "tls_cert": "",
+        "tls_key": ""
       }
     }
   }

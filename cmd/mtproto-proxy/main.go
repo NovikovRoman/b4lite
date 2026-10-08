@@ -148,15 +148,11 @@ func runCmd(args []string) {
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Best-effort background refreshers: current Telegram DC addresses and,
+	// Best-effort background refresher: current Telegram DC addresses and,
 	// if enabled, the Cloudflare-Worker fallback domain list used when a
-	// network blocks Telegram's WebSocket edge directly.
-	go func() {
-		_ = mtproto.RefreshDCs(cfg.System.MTProto.DCFallbackEnabled, cfg.System.MTProto.DCFallbackURL)
-	}()
-	if cfg.System.MTProto.CFProxyEnabled {
-		mtproto.StartCFProxyRefresh(appCtx, cfg.System.MTProto.CFProxyURL)
-	}
+	// network blocks Telegram's WebSocket edge directly. Failures are
+	// retried with backoff instead of waiting for the next periodic run.
+	mtproto.StartUpstreamRefresh(appCtx, func() *config.Config { return &cfg })
 
 	server := mtproto.NewServer(&cfg)
 	if err := server.Start(); err != nil {

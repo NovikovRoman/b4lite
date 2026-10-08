@@ -18,6 +18,11 @@ import (
 // you run this next to something that does mark-based routing.
 var SelfDialMark uint32 = 0
 
+// SelfDialNoDPIBit is the bit b4 ORs into SelfDialMark on relay connections
+// so its DPI engine leaves them alone. There is no DPI engine here, so it is
+// 0 and relay connections carry SelfDialMark unchanged.
+const SelfDialNoDPIBit = uint32(0)
+
 // MTProtoSecret is one configured (or auto-generated) fake-TLS secret.
 type MTProtoSecret struct {
 	ID      string `json:"id"`
@@ -51,12 +56,20 @@ func (m *MTProtoConfig) FirstEnabledSecret() string {
 	return ""
 }
 
-// MTProtoWebProxyConfig controls the optional HTTPS "web proxy" carrier
-// (lets a browser/https client bootstrap a session over TLS on the same
-// port instead of the native fake-TLS handshake).
+// MTProtoWebProxyConfig controls the optional Telegram Desktop "WEB proxy"
+// relay: an HTTPS listener of its own (Port) that answers Hostname as the
+// relay and every other host with a placeholder page.
 type MTProtoWebProxyConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Hostname string `json:"hostname"`
+	// Port is the relay listener's port on BindAddress; 0 leaves the relay
+	// off, since b4lite has no web server of its own to serve it from.
+	Port int `json:"port"`
+	// TLSCert/TLSKey are the PEM certificate and key for the relay port.
+	// Without them it serves plain HTTP, which needs a TLS-terminating
+	// proxy in front, as Telegram Desktop only speaks HTTPS.
+	TLSCert string `json:"tls_cert"`
+	TLSKey  string `json:"tls_key"`
 }
 
 // MTProtoConfig is the full set of knobs the mtproto server understands.
@@ -74,9 +87,15 @@ type MTProtoConfig struct {
 	UpstreamMode      string          `json:"upstream_mode"` // "auto" | "ws" | "tcp"
 	WSCustomDomain    string          `json:"ws_custom_domain"`
 	WSEndpointHost    string          `json:"ws_endpoint_host"`
-	CFProxyEnabled    bool            `json:"cfproxy_enabled"`
-	CFProxyURL        string          `json:"cfproxy_url"`
-	CFWorkerDomain    string          `json:"cfworker_domain"`
+	// WSFrontSNI is an alternative TLS name (e.g. "sprinthost.ru") tried
+	// for Telegram's WS edge after a handshake for kws*.web.telegram.org
+	// fails, for networks that block those names. Empty or "off" disables
+	// it; a handshake that does not end on a telegram.org certificate is
+	// closed.
+	WSFrontSNI     string `json:"ws_front_sni"`
+	CFProxyEnabled bool   `json:"cfproxy_enabled"`
+	CFProxyURL     string `json:"cfproxy_url"`
+	CFWorkerDomain string `json:"cfworker_domain"`
 
 	DCFallbackEnabled bool   `json:"dc_fallback_enabled"`
 	DCFallbackURL     string `json:"dc_fallback_url"`
@@ -87,6 +106,11 @@ type MTProtoConfig struct {
 	// WebSocket bridge (see internal/mtproto/transparent.go); left here so
 	// the package compiles unmodified. Not exposed over JSON.
 	BridgeSkipNativeEdge bool `json:"-"`
+
+	// CFWorkerDPI lets b4's DPI-bypass sets process connections to the
+	// Cloudflare Worker. There are no sets here; kept so the package
+	// compiles unmodified. Not exposed over JSON.
+	CFWorkerDPI bool `json:"-"`
 }
 
 // QueueConfig only carries the one field the mtproto package reads
@@ -111,8 +135,25 @@ type Config struct {
 	System SystemConfig `json:"system"`
 }
 
+// TelegramInUse reports whether anything needs Telegram's DC list and the
+// Cloudflare proxy list refreshed. Upstream also counts the transparent
+// bridge and routing sets; here only the proxy itself can use them.
+func (c *Config) TelegramInUse() bool {
+	return c != nil && c.System.MTProto.Enabled
+}
+
 type SystemConfig struct {
 	MTProto MTProtoConfig `json:"mtproto"`
+
+	// WebServer stands in for b4's web interface settings, whose TLS pair
+	// the WEB proxy relay falls back to. There is no web interface here;
+	// kept so the package compiles unmodified. Not exposed over JSON.
+	WebServer WebServerConfig `json:"-"`
+}
+
+type WebServerConfig struct {
+	TLSCert string
+	TLSKey  string
 }
 
 const (

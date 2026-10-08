@@ -56,9 +56,17 @@ type TransparentBridge struct {
 	cfg     atomic.Pointer[config.Config]
 	bufPool sync.Pool
 
-	mu       sync.Mutex
-	pool     *cfWorkerPool
-	poolInit bool
+	relayed     atomic.Uint64
+	failedOpen  atomic.Uint64
+	dialFailed  atomic.Uint64
+	dropped     atomic.Uint64
+	lastRelayed atomic.Int64
+
+	mu        sync.Mutex
+	pool      *cfWorkerPool
+	poolInit  bool
+	wsPool    *wsPool
+	wsPoolFor MTProtoUpstream
 }
 
 func NewTransparentBridge(cfg *config.Config) *TransparentBridge {
@@ -69,11 +77,13 @@ func NewTransparentBridge(cfg *config.Config) *TransparentBridge {
 		}},
 	}
 	b.cfg.Store(cfg)
+	setWorkerFollowsSets(cfg)
 	return b
 }
 
 func (b *TransparentBridge) UpdateConfig(newCfg *config.Config) {
 	old := b.cfg.Swap(newCfg)
+	setWorkerFollowsSets(newCfg)
 	if old != nil &&
 		old.System.MTProto.CFWorkerDomain == newCfg.System.MTProto.CFWorkerDomain &&
 		old.Queue.Mark == newCfg.Queue.Mark {
@@ -85,6 +95,68 @@ func (b *TransparentBridge) UpdateConfig(newCfg *config.Config) {
 	b.poolInit = false
 	b.mu.Unlock()
 	oldPool.close()
+}
+
+type BridgeStats struct {
+	Relayed       uint64 `json:"relayed"`
+	FailedOpen    uint64 `json:"failed_open"`
+	DialFailed    uint64 `json:"dial_failed"`
+	Dropped       uint64 `json:"dropped"`
+	LastRelayedAt string `json:"last_relayed_at,omitempty"`
+}
+
+func (b *TransparentBridge) Stats() BridgeStats {
+	st := BridgeStats{
+		Relayed:    b.relayed.Load(),
+		FailedOpen: b.failedOpen.Load(),
+		DialFailed: b.dialFailed.Load(),
+		Dropped:    b.dropped.Load(),
+	}
+	if ns := b.lastRelayed.Load(); ns > 0 {
+		st.LastRelayedAt = time.Unix(0, ns).UTC().Format(time.RFC3339)
+	}
+	return st
+}
+
+func (b *TransparentBridge) failOpen(conn net.Conn) (bool, net.Conn) {
+	b.failedOpen.Add(1)
+	return false, conn
+}
+
+func (b *TransparentBridge) getWSPool() *wsPool {
+	shared := sharedWSPool.Load()
+	if shared != nil && shared.ctx.Err() != nil {
+		shared = nil
+	}
+	mt := b.cfg.Load().System.MTProto
+	want := MTProtoUpstream{WSEndpointHost: mt.WSEndpointHost, WSCustomDomain: mt.WSCustomDomain, CFProxyEnabled: mt.CFProxyEnabled, FrontSNI: wsFrontName(mt.WSFrontSNI)}
+	b.mu.Lock()
+	var stale *wsPool
+	if shared != nil || (b.wsPool != nil && b.wsPoolFor != want) {
+		stale, b.wsPool = b.wsPool, nil
+	}
+	if shared == nil && b.wsPool == nil {
+		b.wsPool = newWSPool(want, selfDialMark(), wsPoolDefaultSize)
+		b.wsPoolFor = want
+	}
+	own := b.wsPool
+	b.mu.Unlock()
+	if stale != nil {
+		stale.close()
+	}
+	if shared != nil {
+		return shared
+	}
+	return own
+}
+
+func (b *TransparentBridge) Close() {
+	b.mu.Lock()
+	ws, worker := b.wsPool, b.pool
+	b.wsPool, b.pool, b.poolInit = nil, nil, false
+	b.mu.Unlock()
+	ws.close()
+	worker.close()
 }
 
 // getPool returns the Worker pool, or nil when no Worker is configured.
@@ -124,6 +196,7 @@ func (b *TransparentBridge) Handle(client net.Conn, origIP net.IP, origPort int)
 		default:
 			log.Tracef("%s bridge handshake read from %s:%d failed: %v -> drop", tag, origIP, origPort, ferr)
 		}
+		b.dropped.Add(1)
 		return true, nil
 	}
 
@@ -133,46 +206,36 @@ func (b *TransparentBridge) Handle(client net.Conn, origIP net.IP, origPort int)
 	if herr != nil {
 		_ = client.SetReadDeadline(time.Time{})
 		log.Debugf("%s bridge short head (%d B) from %s:%d -> fail open", tag, head, origIP, origPort)
-		return false, &prefixConn{Conn: client, prefix: append([]byte(nil), init[:head]...)}
+		return b.failOpen(&prefixConn{Conn: client, prefix: append([]byte(nil), init[:head]...)})
 	}
 	if reservedFirst4(init[:4]) {
 		_ = client.SetReadDeadline(time.Time{})
 		log.Debugf("%s bridge non-obfuscated transport (% x) from %s:%d -> fail open", tag, init[:4], origIP, origPort)
-		return false, &prefixConn{Conn: client, prefix: append([]byte(nil), init[:4]...)}
+		return b.failOpen(&prefixConn{Conn: client, prefix: append([]byte(nil), init[:4]...)})
 	}
 	n, rerr := io.ReadFull(client, init[4:])
 	_ = client.SetReadDeadline(time.Time{})
 	if rerr != nil {
 		log.Debugf("%s bridge short handshake (%d/%d B) from %s:%d -> fail open", tag, 4+n, obfuscatedFrameLen, origIP, origPort)
-		return false, &prefixConn{Conn: client, prefix: append([]byte(nil), init[:4+n]...)}
+		return b.failOpen(&prefixConn{Conn: client, prefix: append([]byte(nil), init[:4+n]...)})
 	}
 
 	res, derr := decodeObfuscatedDirect(init, client)
 	if derr != nil {
-		log.Debugf("%s bridge obfuscated decode failed from %s:%d: %v -> fail open", tag, origIP, origPort, derr)
-		return false, &prefixConn{Conn: client, prefix: append([]byte(nil), init...)}
+		if looksLikeTLSRecord(init) {
+			log.Debugf("%s bridge TLS handshake from %s:%d is HTTPS, not MTProto -> fail open", tag, origIP, origPort)
+		} else {
+			log.Debugf("%s bridge obfuscated decode failed from %s:%d: %v -> fail open", tag, origIP, origPort, derr)
+		}
+		return b.failOpen(&prefixConn{Conn: client, prefix: append([]byte(nil), init...)})
 	}
 	log.Tracef("%s bridge handshake ok from %s:%d: proto=0x%08x handshake-dc=%d", tag, origIP, origPort, res.ProtoTag, res.DC)
 
-	var dc int
-	var dcSrc string
-	if mapped, ok := dcForIP(origIP); ok {
-		dc, dcSrc = mapped, "ip"
-	} else if validTransparentDC(res.DC) {
-		dc, dcSrc = res.DC, "handshake"
-	} else if mapped, ok := dcForIPRange(origIP); ok {
-		dc, dcSrc = mapped, "ip-range"
-	} else {
+	choice, resolved := bridgeChooseDC(tag, origIP, res.DC)
+	dc, dcSrc := choice.dc, choice.src
+	if !resolved {
 		log.Debugf("%s bridge unresolved DC for %s:%d (handshake dc=%d proto=0x%08x) -> fail open", tag, origIP, origPort, res.DC, res.ProtoTag)
-		return false, &prefixConn{Conn: client, prefix: append([]byte(nil), init...)}
-	}
-	if signed, ok := applyHandshakeMedia(dc, res.DC); ok {
-		log.Debugf("%s bridge DC%d is the media cluster per handshake -> using DC%d (src=%s+handshake-media)", tag, dc, signed, dcSrc)
-		dc = signed
-		dcSrc += "+handshake-media"
-	}
-	if rng, ok := dcForIPRange(origIP); ok && validTransparentDC(res.DC) && rng != res.DC {
-		log.Debugf("%s bridge DC ambiguity for %s: ip-range=DC%d handshake=DC%d -> using DC%d (src=%s)", tag, origIP, rng, res.DC, dc, dcSrc)
+		return b.failOpen(&prefixConn{Conn: client, prefix: append([]byte(nil), init...)})
 	}
 
 	cfg := b.cfg.Load()
@@ -181,8 +244,9 @@ func (b *TransparentBridge) Handle(client net.Conn, origIP net.IP, origPort int)
 	mtCfg.DCRelay = ""
 
 	target := dialTarget{ip: origIP.String(), port: origPort}
-	dcConn, info, err := dialObfuscatedDC(&mtCfg, cfg.Queue, dc, res.ProtoTag, &dialPools{worker: b.getPool()}, id, target)
+	dcConn, info, err := dialObfuscatedDC(&mtCfg, cfg.Queue, dc, res.ProtoTag, &dialPools{ws: b.getWSPool(), worker: b.getPool()}, id, target)
 	if err != nil {
+		b.dialFailed.Add(1)
 		if shouldLogDialError(dc) {
 			_ = log.Errorf("%s bridge dial DC %d failed: %v", tag, dc, err)
 		} else {
@@ -193,6 +257,8 @@ func (b *TransparentBridge) Handle(client net.Conn, origIP net.IP, origPort int)
 	defer func() {
 		_ = dcConn.Close()
 	}()
+	b.relayed.Add(1)
+	b.lastRelayed.Store(time.Now().UnixNano())
 
 	label := fmt.Sprintf("%s %s<->DC%d(transparent via %s)", tag, client.RemoteAddr(), dc, info.transport)
 	log.Infof("%s bridge relay %s:%d -> DC%d via %s [dc-from=%s]", tag, origIP, origPort, dc, info.transport, dcSrc)
@@ -205,7 +271,7 @@ func (b *TransparentBridge) Handle(client net.Conn, origIP net.IP, origPort int)
 		idle:           mtprotoIdleTimeout(cfg),
 		onStall:        stallReporter(info),
 		scan:           newDCFrameScanner(res.ProtoTag),
-		onTransportErr: transportErrHandler(info, dc, label),
+		onTransportErr: choice.errHandler(info, label, origIP),
 	})
 	return true, nil
 }
@@ -221,7 +287,27 @@ func stallReporter(info dialInfo) func() {
 	return func() { workerRecordStall(info.worker) }
 }
 
+func (b *TransparentBridge) FailOpenOrder(origIP net.IP, origPort int) (directFirst, workerFallback bool) {
+	if origPort != failOpenWorkerPort {
+		return true, false
+	}
+	mt := b.cfg.Load().System.MTProto
+	for _, wd := range workerDomains(&mt) {
+		if !workerInCooldown(wd) {
+			return failOpenPrefersDirect(origIP.String()), true
+		}
+	}
+	return true, false
+}
+
+func (b *TransparentBridge) NoteFailOpenDirect(origIP net.IP, dialed bool, received int64) {
+	failOpenRemember(origIP.String(), dialed && received > 0)
+}
+
 func (b *TransparentBridge) FailOpenViaWorker(client net.Conn, origIP net.IP, origPort int) bool {
+	if origPort != failOpenWorkerPort {
+		return false
+	}
 	cfg := b.cfg.Load()
 	mt := cfg.System.MTProto
 	domains := workerDomains(&mt)
@@ -238,11 +324,11 @@ func (b *TransparentBridge) FailOpenViaWorker(client net.Conn, origIP net.IP, or
 		dc = m
 	}
 	for _, wd := range domains {
-		if workerInCooldown(wd) && len(domains) > 1 {
+		if workerInCooldown(wd) {
 			continue
 		}
 		path := fmt.Sprintf("/apiws?dst=%s&dc=%d", dst, dc)
-		wc, derr := dialWS(wd, wd, path, wsDialTimeout, selfDialMark())
+		wc, derr := dialWS(wd, wd, path, wsDialTimeout, workerDialMark(selfDialMark()))
 		if derr != nil {
 			log.Debugf("%s failopen worker dial %s for %s:%d failed: %v", tag, wd, dst, origPort, derr)
 			continue
@@ -251,11 +337,17 @@ func (b *TransparentBridge) FailOpenViaWorker(client net.Conn, origIP net.IP, or
 		label := fmt.Sprintf("%s %s<->%s:%d(failopen)", tag, client.RemoteAddr(), dst, origPort)
 		// No scanner here: the fail-open relay carries the client's obfuscated
 		// stream untouched, so the transport framing is still encrypted.
+		workerStalled := stallReporter(dialInfo{isWorker: true, worker: wd})
 		relayConns(client, wc, relayOpts{
 			label:   label,
 			bufPool: &b.bufPool,
 			idle:    mtprotoIdleTimeout(cfg),
-			onStall: stallReporter(dialInfo{isWorker: true, worker: wd}),
+			onStall: func() {
+				if workerStalled != nil {
+					workerStalled()
+				}
+				failOpenRemember(dst, true)
+			},
 		})
 		return true
 	}
@@ -282,4 +374,8 @@ func applyHandshakeMedia(resolved, handshake int) (int, bool) {
 
 func reservedFirst4(b []byte) bool {
 	return isReservedFirst4(b)
+}
+
+func looksLikeTLSRecord(b []byte) bool {
+	return len(b) >= 3 && b[0] == 0x16 && b[1] == 0x03 && b[2] <= 0x04
 }

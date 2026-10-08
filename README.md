@@ -142,6 +142,7 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
       "upstream_mode": "auto",
       "ws_custom_domain": "",
       "ws_endpoint_host": "149.154.167.220",
+      "ws_front_sni": "",
       "cfproxy_enabled": true,
       "cfproxy_url": "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
       "cfworker_domain": "",
@@ -149,7 +150,10 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
       "dc_fallback_url": "https://proxy.lavrush.in/telegram/getProxyConfig",
       "web_proxy": {
         "enabled": false,
-        "hostname": ""
+        "hostname": "",
+        "port": 0,
+        "tls_cert": "",
+        "tls_key": ""
       }
     }
   }
@@ -176,13 +180,16 @@ go build -o mtproto-proxy ./cmd/mtproto-proxy
 | `system.mtproto.upstream_mode`            | `auto` \| `ws` \| `tcp` - способ обращения к дата-центрам Telegram                                |
 | `system.mtproto.ws_custom_domain`         | пользовательский домен для WebSocket-подключения к Telegram                                      |
 | `system.mtproto.ws_endpoint_host`         | IP-адрес WebSocket-эндпоинта Telegram                                                            |
+| `system.mtproto.ws_front_sni`             | запасное TLS-имя (например, `sprinthost.ru`) для WebSocket-эндпоинта Telegram, если рукопожатие с `kws*.web.telegram.org` блокируется; соединение без сертификата telegram.org закрывается. Пусто или `off` - выключено |
 | `system.mtproto.cfproxy_enabled`          | использовать ли резервные Cloudflare Worker-домены при недоступности прямого подключения          |
 | `system.mtproto.cfproxy_url`              | URL, откуда подтягивается список Cloudflare Worker-доменов                                        |
 | `system.mtproto.cfworker_domain`          | конкретный домен Cloudflare Worker (если не хотите полагаться на автоматический список)           |
 | `system.mtproto.dc_fallback_enabled`      | подтягивать ли резервный список адресов дата-центров с `dc_fallback_url`                          |
 | `system.mtproto.dc_fallback_url`          | URL резервного списка адресов дата-центров Telegram                                              |
-| `system.mtproto.web_proxy.enabled`        | включить дополнительный HTTPS "веб-прокси" - позволяет браузеру/https-клиенту стартовать сессию поверх обычного TLS на том же порту, вместо fake-TLS рукопожатия |
-| `system.mtproto.web_proxy.hostname`       | хостнейм, под которым этот HTTPS "веб-прокси" должен себя предъявлять                             |
+| `system.mtproto.web_proxy.enabled`        | включить релей "WEB proxy" для Telegram Desktop на отдельном порту: запросы к `hostname` обслуживаются как релей, всё остальное получает страницу-заглушку |
+| `system.mtproto.web_proxy.hostname`       | хостнейм релея                                                                                   |
+| `system.mtproto.web_proxy.port`           | порт релея на `bind_address`; `0` - релей не запускается                                          |
+| `system.mtproto.web_proxy.tls_cert` / `tls_key` | PEM-сертификат и ключ релея. Без них релей работает по HTTP, и перед ним нужен TLS-терминирующий прокси (Telegram Desktop умеет только HTTPS). Заглушку можно заменить файлом `webproxy_page.html` рядом с конфигом |
 
 ## Генерация секретов отдельно
 
